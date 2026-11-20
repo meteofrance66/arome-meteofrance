@@ -1,0 +1,132 @@
+stages:
+  - build
+  - publish
+
+variables:
+  # Garde l'environnement Python d'un run a l'autre (sinon GitLab l'efface et tout est reinstalle).
+  GIT_CLEAN_FLAGS: "-ffdx -e .venv"
+  PYTHONUNBUFFERED: "1"
+  DEPOT: "alertes-meteo-group/arome-meteofrance"
+  FORCE: "false"
+
+default:
+  tags:
+    - vps
+    - cep
+  timeout: 300m
+
+# Traduit de .github/workflows/update-arome.yml pour le runner du VPS.
+build:
+  stage: build
+  script:
+    - test -d .venv || python3.12 -m venv .venv
+    - . .venv/bin/activate
+    - python -m pip install --disable-pip-version-check -q -r requirements.txt
+    - |
+      FORCE_ARG=""
+      if [ "$FORCE" = "true" ]; then FORCE_ARG="--force"; fi
+      export FORCE_ARG
+      # --- Installer les dépendances
+      python -m pip install --disable-pip-version-check -r requirements.txt
+      # --- Produire les cartes et les prévisions AROME
+      # Coupures passagères de la source (connexion fermée, 429/5xx, délai dépassé) : jusqu'à 3 tentatives.
+      set -o pipefail
+      for attempt in 1 2 3; do
+        if python scripts/update_arome_france.py \
+          --catalog config/communes-france.json \
+          --output-dir build/national \
+          --forecast-hours 48 \
+          --zone-km 35 \
+          --zone-depts 66,11,09 \
+          --current-metadata-url \
+          "https://gitlab.com/alertes-meteo-group/arome-meteofrance/-/raw/data/index.json" 2>&1 | tee tentative.log; then
+          break
+        fi
+        if [ "$attempt" -eq 3 ] || ! grep -qiE 'RemoteDisconnected|Connection(Error|Reset|refused| aborted)|IncompleteRead|ReadTimeout|ConnectTimeout|ChunkedEncodingError|ProtocolError|Max retries exceeded|Temporary failure in name resolution|Name or service not known|SSLError|HTTP ?(Error)?:? ?(429|500|502|503|504)|(429|502|503|504) (Too Many|Bad Gateway|Service Unavailable|Gateway Time|Server)|Server is busy|ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|timed out|Read timed' tentative.log; then
+          echo "ERREUR : Échec (tentative $attempt)"
+          exit 1
+        fi
+        echo "Erreur réseau passagère (tentative $attempt), nouvelle tentative dans 90 s"
+        sleep 90
+      done
+      if test -f build/national/index.json; then
+        echo "publish=true" > /dev/null
+      else
+        echo "publish=false" > /dev/null
+        echo "Aucune nouvelle publication AROME complète à envoyer."
+      fi
+      # --- Vérifier la publication
+      python - <<'PY'
+      import json
+      from pathlib import Path
+
+      root = Path("build/national")
+      index = json.loads((root / "index.json").read_text(encoding="utf-8"))
+      maps = json.loads((root / "maps/index.json").read_text(encoding="utf-8"))
+      assert index["status"] == "ok"
+      assert index["coverage"]["communes"] >= 400
+      assert index["coverage"]["departments"] >= 3
+      assert len(maps["layers"]) >= 20
+      # Run tronqué accepté (publication progressive Météo-France) : on exige les échéances annoncées.
+      assert len(maps["steps"]) >= index["model"]["forecast_hours_requested"]
+      assert (root / "departements/66.json").is_file()
+      print(
+          f"Validation OK : {len(maps['layers'])} cartes, "
+          f"{len(maps['steps'])} échéances, "
+          f"{index['coverage']['communes']} communes"
+      )
+      PY
+  artifacts:
+    paths:
+      - build/national/
+    expire_in: 2 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+
+# Publication de la branche data (necessite la variable CI/CD masquee GITLAB_PUSH_TOKEN).
+publish-data:
+  stage: publish
+  needs: [build]
+  script:
+    - test -f build/national/index.json || { echo "Rien a publier."; exit 0; }
+    - PUB=$(mktemp -d) && cp -a build/national/. "$PUB/" && touch "$PUB/.nojekyll"
+    - cd "$PUB"
+    - git init -b data
+    - git config user.name "gitlab-ci[bot]"
+    - git config user.email "gitlab-ci@alertes-meteo-group.invalid"
+    - git add --all
+    - git commit -q -m "Donnees $(date -u +'%Y-%m-%d %H:%M UTC')"
+    - git remote add origin "git@gitlab.com:${DEPOT}.git"
+    - git push -q --force origin data
+    - cd / && rm -rf "$PUB"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+
+# Republie la branche data sur GitLab Pages : les navigateurs peuvent y lire les fichiers (GitLab raw n'envoie pas l'autorisation CORS).
+# Se lance aussi a chaque envoi sur main (sans refaire le calcul) : la branche data deja publiee est simplement republiee.
+pages:
+  stage: publish
+  allow_failure: true
+  needs:
+    - job: publish-data
+      optional: true
+  script:
+    - rm -rf public
+    - git clone -q --depth 1 --branch data "https://gitlab.com/${DEPOT}.git" public
+    - rm -rf public/.git
+    - test -f public/index.json
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "trigger"

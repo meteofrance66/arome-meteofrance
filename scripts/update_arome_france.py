@@ -59,6 +59,10 @@ AROME_LON_FIRST = -12.0
 AROME_STEP = 0.01
 
 MAP_WIDTH = 2200
+ZONE_MODE = False
+ZONE_BOUNDS = {"south": 41.3, "west": 0.4, "north": 43.9, "east": 4.6}
+ZONE_MAP_WIDTH = 1200
+ZONE_MAP_HEIGHT = 1010
 MAP_HEIGHT = 1640
 
 # Format compact partagé avec le JavaScript. Les diagnostics explicitement
@@ -259,6 +263,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force la reconstruction même si ce run est déjà publié",
     )
+    parser.add_argument(
+        "--zone-depts",
+        default="",
+        help="Zone réduite : départements retenus, séparés par des virgules (ex. 66,11,09). Vide = tous",
+    )
+    parser.add_argument(
+        "--zone-km",
+        type=float,
+        default=0.0,
+        help=(
+            "Zone réduite : ne garde que les communes à moins de N km d'une commune "
+            "des Pyrénées-Orientales (0 = France entière)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -311,12 +329,41 @@ def grid_index(latitude: float, longitude: float) -> tuple[int, float, float]:
     return index, model_latitude, model_longitude
 
 
-def load_catalog(path: Path) -> NationalCatalog:
+def zone_filter(raw_communes: list[Any], zone_km: float, zone_depts: str = "") -> list[Any]:
+    """Garde les communes à moins de zone_km d'une commune du 66 (distance orthodromique)."""
+    if zone_km <= 0:
+        return raw_communes
+    retenus = {d.strip().upper() for d in zone_depts.split(",") if d.strip()}
+    reference = np.asarray(
+        [(float(c[5]), float(c[6])) for c in raw_communes if str(c[2]).upper() == "66"],
+        dtype=np.float64,
+    )
+    if len(reference) == 0:
+        raise RuntimeError("Zone réduite impossible : aucune commune du 66 dans le catalogue")
+    ref_lat = np.radians(reference[:, 0])
+    ref_lon = np.radians(reference[:, 1])
+    kept: list[Any] = []
+    for commune in raw_communes:
+        if retenus and str(commune[2]).upper() not in retenus:
+            continue
+        lat = np.radians(float(commune[5]))
+        lon = np.radians(float(commune[6]))
+        a = (
+            np.sin((ref_lat - lat) / 2) ** 2
+            + np.cos(lat) * np.cos(ref_lat) * np.sin((ref_lon - lon) / 2) ** 2
+        )
+        if 2 * 6371.0 * np.arcsin(np.sqrt(a.min())) <= zone_km:
+            kept.append(commune)
+    return kept
+
+
+def load_catalog(path: Path, zone_km: float = 0.0, zone_depts: str = "") -> NationalCatalog:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     raw_communes = payload.get("communes") or []
     if len(raw_communes) < 34_000:
         raise RuntimeError("Le catalogue communal France est incomplet")
+    raw_communes = zone_filter(raw_communes, zone_km, zone_depts)
 
     mapped: list[tuple[list[Any], int, float, float]] = []
     point_coordinates: dict[int, tuple[float, float]] = {}
@@ -390,7 +437,7 @@ def load_catalog(path: Path) -> NationalCatalog:
             communes=compact_communes,
         )
 
-    if len(departments) != 96:
+    if zone_km <= 0 and len(departments) != 96:
         raise RuntimeError(
             f"Nombre inattendu de départements métropolitains : {len(departments)}"
         )
@@ -745,10 +792,12 @@ def inverse_mercator(value: np.ndarray) -> np.ndarray:
 class MapSampler:
     """Rééchantillonne la grille régulière AROME sur la carte Web Mercator."""
 
-    def __init__(self, width: int, height: int) -> None:
+    def __init__(
+        self, width: int, height: int, bounds: dict[str, float] | None = None
+    ) -> None:
         self.width = int(width)
         self.height = int(height)
-        bounds = DEFAULT_BOUNDS
+        bounds = bounds or DEFAULT_BOUNDS
         target_latitudes = inverse_mercator(
             np.linspace(
                 mercator(np.asarray(float(bounds["north"]))),
@@ -1254,13 +1303,26 @@ def build_product(
         for code in catalog.departments
     }
     grid = NationalGrid(catalog)
-    map_sampler = MapSampler(MAP_WIDTH, MAP_HEIGHT)
+    if ZONE_MODE:
+        south = float(np.min(catalog.point_latitudes)) - 0.3
+        north = float(np.max(catalog.point_latitudes)) + 0.3
+        west = float(np.min(catalog.point_longitudes)) - 0.4
+        east = float(np.max(catalog.point_longitudes)) + 0.4
+        map_bounds = {"south": south, "west": west, "north": north, "east": east}
+        map_width = 1000
+        y_span = float(mercator(np.asarray(north)) - mercator(np.asarray(south)))
+        x_span = float(np.radians(east - west))
+        map_height = max(300, int(round(map_width * y_span / x_span)))
+    else:
+        map_width, map_height, map_bounds = MAP_WIDTH, MAP_HEIGHT, DEFAULT_BOUNDS
+    map_sampler = MapSampler(map_width, map_height, bounds=map_bounds)
     map_renderer = AromeMapRenderer(
         np.empty(0),
         np.empty(0),
         result_directory / "maps",
-        width=MAP_WIDTH,
-        height=MAP_HEIGHT,
+        width=map_width,
+        height=map_height,
+        bounds=map_bounds,
         france_latitudes=catalog.point_latitudes,
         france_longitudes=catalog.point_longitudes,
         france_departments=catalog.point_departments,
@@ -1484,7 +1546,9 @@ def main() -> int:
     if not 0 <= args.catalog_retry_seconds <= 600:
         raise ValueError("catalog-retry-seconds doit être compris entre 0 et 600")
 
-    catalog = load_catalog(Path(args.catalog))
+    global ZONE_MODE
+    ZONE_MODE = args.zone_km > 0
+    catalog = load_catalog(Path(args.catalog), args.zone_km, args.zone_depts)
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     if args.resource_directory:
