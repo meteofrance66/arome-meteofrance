@@ -3,7 +3,7 @@ name: Mise à jour AROME France
 on:
   workflow_dispatch:
   schedule:
-    - cron: "12 3 * * *"
+    - cron: "50 3 * * *"
 
 permissions:
   contents: write
