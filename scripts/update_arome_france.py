@@ -642,6 +642,25 @@ def wait_for_complete_remote_run(
     return None
 
 
+def published_end(url: str) -> datetime | None:
+    """Fin (run + échéance couverte) de ce qui est déjà publié, ou None si on ne peut pas le lire."""
+    if not url:
+        return None
+    try:
+        response = requests.get(url, timeout=(10, 30), headers={"User-Agent": USER_AGENT})
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        model = payload.get("model") or {}
+        run = parse_run_text(model.get("run_time"))
+        hours = model.get("forecast_hours_requested")
+        if run is None or not isinstance(hours, int):
+            return None
+        return run + timedelta(hours=hours)
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+
+
 def already_published(url: str, run_time: datetime | None, hours: int) -> bool:
     if not url or run_time is None:
         return False
@@ -1566,6 +1585,23 @@ def main() -> int:
             return 0
         resources, run_hint, hours = selection
     LOGGER.info("Run AROME sélectionné : %s", iso_utc(run_hint) or "GRIB local")
+    if (
+        not args.force
+        and not args.resource_directory
+        and hours < args.forecast_hours
+        and run_hint is not None
+    ):
+        # Run tronqué : on ne remplace pas une publication qui va plus loin dans le temps (sinon le lendemain disparaît des pages).
+        fin_publiee = published_end(args.current_metadata_url)
+        fin_nouvelle = run_hint + timedelta(hours=hours)
+        if fin_publiee is not None and fin_publiee > fin_nouvelle:
+            LOGGER.info(
+                "Run tronqué à +%s h (fin %s) : la publication actuelle va jusqu'à %s, elle est conservée.",
+                hours,
+                iso_utc(fin_nouvelle),
+                iso_utc(fin_publiee),
+            )
+            return 0
     if not args.force and not args.resource_directory and already_published(
         args.current_metadata_url, run_hint, hours
     ):
